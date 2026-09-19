@@ -101,6 +101,29 @@ type DB struct {
 	// polled flushChan from writeRequests.
 	flushCond *sync.Cond
 
+	// writeGate is the edge-triggered wakeup channel for user writes parked in
+	// admitWrite while a configured backpressure limit is reached (block mode).
+	// Waiters select on it together with their ctx.Done(), which is what makes
+	// the block mode cancellable. writeGateClosed is closed once during Close()
+	// so parked callers return ErrBlockedWrites instead of waiting forever.
+	// Both are allocated in Open regardless of whether limits are configured.
+	writeGate       chan struct{}
+	writeGateClosed chan struct{}
+
+	// bpBlocked / bpRejected are cumulative backpressure counters, exposed via
+	// WriteBackpressureStats and expvar. Blocked counts writes that were held
+	// back in block mode (regardless of whether they later resumed or were
+	// cancelled); rejected counts fast-fails with ErrWriteBackpressure.
+	bpBlocked  atomic.Uint64
+	bpRejected atomic.Uint64
+
+	// bpPendingGauge is a lock-free gauge of numPendingMemtablesLocked(),
+	// maintained at every point that count changes. It lets monitoring gauges
+	// be published from contexts that already hold db.lock (e.g. compaction
+	// running under DropPrefix) without re-entering the lock. The authoritative
+	// predicate still reads imm/mt directly under db.lock.
+	bpPendingGauge atomic.Int32
+
 	// Initialized via openMemTables.
 	nextMemFid int
 
@@ -146,6 +169,22 @@ func checkAndSetOptions(opt *Options) error {
 	// on level 2.
 	if opt.NumCompactors == 1 {
 		return errors.New("Cannot have 1 compactor. Need at least 2")
+	}
+
+	switch opt.BackpressureMode {
+	case WriteBackpressureBlock, WriteBackpressureReject:
+	default:
+		return errors.New("Invalid BackpressureMode")
+	}
+	if opt.MaxPendingMemtables < 0 || opt.MaxL0Tables < 0 {
+		return errors.New("MaxPendingMemtables and MaxL0Tables must be zero (disabled) or positive")
+	}
+	// A write-path L0 cap above the flush goroutine's own hard stall threshold
+	// would never be observable and would make the configured mode misleading
+	// (block would always win over reject at that point). Reject it at Open.
+	if opt.MaxL0Tables > opt.NumLevelZeroTablesStall {
+		return fmt.Errorf("MaxL0Tables (%d) must be <= NumLevelZeroTablesStall (%d)",
+			opt.MaxL0Tables, opt.NumLevelZeroTablesStall)
 	}
 
 	if opt.InMemory && (opt.Dir != "" || opt.ValueDir != "") {
@@ -252,6 +291,8 @@ func Open(opt Options) (*DB, error) {
 		imm:              make([]*memTable, 0, opt.NumMemtables),
 		flushChan:        make(chan *memTable, opt.NumMemtables),
 		writeCh:          make(chan *request, kvWriteChCapacity),
+		writeGate:        make(chan struct{}, 1),
+		writeGateClosed:  make(chan struct{}),
 		opt:              opt,
 		manifest:         manifestFile,
 		dirLockGuard:     dirLockGuard,
@@ -350,6 +391,7 @@ func Open(opt Options) (*DB, error) {
 			return nil, y.Wrapf(err, "cannot create memtable")
 		}
 	}
+	db.bpPendingGauge.Store(int32(1 + len(db.imm))) // active mt + recovered immutables
 
 	// newLevelsController potentially loads files in directory.
 	if db.lc, err = newLevelsController(db, &manifest); err != nil {
@@ -568,10 +610,16 @@ func (db *DB) close() (err error) {
 	db.lock.Lock()
 	db.blockWrites.Store(1)
 	db.isClosed.Store(1)
-	if db.flushCond != nil {
-		db.flushCond.Broadcast()
-	}
 	db.lock.Unlock()
+	// Wake everyone parked on write backpressure: user writes in admitWrite
+	// (writeGate + closed channel), the serial write goroutine in
+	// ensureRoomForWrite (flushCond), and the flush goroutine stalled in
+	// addLevel0Table (l0stall cond, signalled in stopMemoryFlush). The
+	// Store above happens under db.lock, the same lock every waiter's predicate
+	// check uses, so the close wakeup cannot be lost.
+	close(db.writeGateClosed)
+	db.signalWriteProgress()
+	db.publishBackpressureGauges()
 
 	if db.closers.valueGC != nil {
 		// Stop value GC first.
@@ -913,9 +961,15 @@ func (db *DB) writeRequests(reqs []*request) error {
 	return nil
 }
 
-func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
+func (db *DB) sendToWriteCh(ctx context.Context, entries []*Entry) (*request, error) {
 	if db.blockWrites.Load() == 1 {
 		return nil, ErrBlockedWrites
+	}
+	// Apply user-configured write backpressure before accepting the write. In
+	// block mode this may wait (interruptibly via ctx); in reject mode it returns
+	// ErrWriteBackpressure. No-op when no limits are configured.
+	if err := db.admitWrite(ctx); err != nil {
+		return nil, err
 	}
 	var count, size int64
 	for _, e := range entries {
@@ -1009,7 +1063,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 //
 //	Check(kv.BatchSet(entries))
 func (db *DB) batchSet(entries []*Entry) error {
-	req, err := db.sendToWriteCh(entries)
+	req, err := db.sendToWriteCh(context.Background(), entries)
 	if err != nil {
 		return err
 	}
@@ -1025,7 +1079,7 @@ func (db *DB) batchSet(entries []*Entry) error {
 //	   Check(err)
 //	}
 func (db *DB) batchSetAsync(entries []*Entry, f func(error)) error {
-	req, err := db.sendToWriteCh(entries)
+	req, err := db.sendToWriteCh(context.Background(), entries)
 	if err != nil {
 		return err
 	}
@@ -1052,6 +1106,40 @@ func (db *DB) ensureRoomForWrite() error {
 	}
 
 	for {
+		// Bail out when the DB is closing so Close's
+		// closers.writes.SignalAndWait() cannot hang. The gate must be IsClosed()
+		// (set solely by close()), NOT blockWrites: blockWrites is also raised
+		// transiently by blockWrite() during DropPrefix/DropAll, whose
+		// prepareToDrop() drains any already-accepted writes through this path
+		// expressly "so that we don't miss any entries". Bailing on blockWrites
+		// there would drop acknowledged writes under pressure. This matches the
+		// pre-cond behavior, which looped until the push succeeded.
+		if db.IsClosed() {
+			return errNoRoom
+		}
+
+		// User-configured write backpressure. The caller goroutine's admitWrite
+		// gate normally stops writes before they are enqueued, but requests
+		// already on writeCh (and the internal vlog GC writeback) still reach
+		// this memtable rotation, so the limits must be enforced here too to cap
+		// in-memory memtables and L0 tables precisely. While a limit is reached
+		// we must not attempt the flushChan push below (that rotation would
+		// itself exceed the configured cap). In reject mode fail fast; in block
+		// mode park on flushCond alongside the flushChan-full wait. Reject mode
+		// is suppressed while blockWrites is raised transiently by DropPrefix /
+		// DropAll's prepareToDrop: that drain must not drop already-accepted
+		// writes under pressure (see the #2308 regression test), so we wait
+		// instead for the flush to make room.
+		if db.backpressureActiveLocked() {
+			if db.opt.BackpressureMode == WriteBackpressureReject &&
+				db.blockWrites.Load() == 0 {
+				db.incRejected()
+				return ErrWriteBackpressure
+			}
+			db.flushCond.Wait()
+			continue
+		}
+
 		select {
 		case db.flushChan <- db.mt:
 			db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n",
@@ -1065,25 +1153,11 @@ func (db *DB) ensureRoomForWrite() error {
 			// New memtable is empty. We certainly have room.
 			return nil
 		default:
-			// flushChan is full. Rather than busy-sleep, wait to be signalled when
-			// the flush goroutine drains a memtable from imm (which frees a slot in
-			// flushChan). flushCond.Wait atomically releases db.lock (allowing the
-			// flusher to update imm and push) and re-acquires it on wake; we then
-			// re-attempt the non-blocking push in this loop.
-			//
-			// Bail out with errNoRoom ONLY when the DB is closing, so that Close's
-			// closers.writes.SignalAndWait() (which waits for the write goroutine)
-			// cannot hang here. The gate must be IsClosed() (set solely by close()),
-			// NOT blockWrites: blockWrites is also raised transiently by blockWrite()
-			// during DropPrefix/DropAll, and their prepareToDrop() drain flushes any
-			// already-accepted writes through this path expressly "so that we don't
-			// miss any entries". Bailing on blockWrites there would drop acknowledged
-			// writes under flushChan pressure (compaction is still running during the
-			// drain, so waiting for room is safe and cannot deadlock). This matches
-			// the pre-cond behavior, which looped until the push succeeded.
-			if db.IsClosed() {
-				return errNoRoom
-			}
+			// flushChan is full. Wait (without busy-polling) for the flush
+			// goroutine to drain a memtable; flushCond.Wait atomically releases
+			// db.lock and re-acquires it on wake, after which every predicate
+			// is re-checked in this loop. Wakeups arrive from
+			// flushMemtable (slot freed) and from L0 compaction progress.
 			db.flushCond.Wait()
 		}
 	}
@@ -1173,14 +1247,18 @@ func (db *DB) flushMemtable(lc *z.Closer) {
 			// TODO: This logic is dirty AF. Any change and this could easily break.
 			y.AssertTrue(mt == db.imm[0])
 			db.imm = db.imm[1:]
+			db.bpPendingGauge.Add(-1)
 			mt.DecrRef() // Return memory.
 			// unlock
 			db.lock.Unlock()
-			// A memtable has been flushed and removed from imm; a slot in flushChan
-			// is now free. Wake any writer blocked in ensureRoomForWrite so it can
-			// retry its non-blocking push. Broadcasting after unlock is safe because
-			// the waiter re-checks (re-attempts the push) under db.lock in a loop.
-			db.flushCond.Broadcast()
+			// A memtable has been flushed and removed from imm; a slot in
+			// flushChan is now free and the pending-memtable count dropped. Wake
+			// both writers blocked at admission (admitWrite, via writeGate) and
+			// the serial write goroutine blocked in ensureRoomForWrite (via
+			// flushCond). Signalling after unlock is safe because every waiter
+			// re-checks its predicate under db.lock in a loop.
+			db.signalWriteProgress()
+			db.publishBackpressureGauges()
 			break
 		}
 	}
@@ -1241,17 +1319,18 @@ func (db *DB) calculateSize() {
 
 func (db *DB) updateSize(lc *z.Closer) {
 	defer lc.Done()
-	if db.opt.InMemory {
-		return
-	}
-
 	metricsTicker := time.NewTicker(time.Minute)
 	defer metricsTicker.Stop()
 
 	for {
 		select {
 		case <-metricsTicker.C:
-			db.calculateSize()
+			if !db.opt.InMemory {
+				db.calculateSize()
+			}
+			// In-memory mode has no files to size, but the write-backpressure
+			// gauges are still useful for monitoring.
+			db.publishBackpressureGauges()
 		case <-lc.HasBeenClosed():
 			return
 		}
@@ -1736,6 +1815,12 @@ func (db *DB) blockWrite() error {
 	if !db.blockWrites.CompareAndSwap(0, 1) {
 		return ErrBlockedWrites
 	}
+	// Wake writers parked on write backpressure in admitWrite (block mode) so
+	// they observe blockWrites==1 and return ErrBlockedWrites instead of waiting
+	// for flush progress that cannot arrive until the write goroutine exits
+	// below — which would otherwise deadlock. signalWriteProgress also refreshes
+	// the backpressure gauges.
+	db.signalWriteProgress()
 
 	// Make all pending writes finish. The following will also close writeCh.
 	db.closers.writes.SignalAndWait()
@@ -1827,6 +1912,7 @@ func (db *DB) dropAll() (func(), error) {
 	if err != nil {
 		return resume, y.Wrapf(err, "cannot open new memtable")
 	}
+	db.recalcPendingGaugeLocked()
 
 	num, err := db.lc.dropTree()
 	if err != nil {
@@ -1901,6 +1987,7 @@ func (db *DB) DropPrefix(prefixes ...[]byte) error {
 	if err != nil {
 		return y.Wrapf(err, "cannot create new mem table")
 	}
+	db.recalcPendingGaugeLocked()
 
 	// Drop prefixes from the levels.
 	if err := db.lc.dropPrefixes(filtered); err != nil {
@@ -1962,7 +2049,7 @@ func (db *DB) BanNamespace(ns uint64) error {
 		Key:   key,
 		Value: nil,
 	}}
-	req, err := db.sendToWriteCh(entry)
+	req, err := db.sendToWriteCh(context.Background(), entry)
 	if err != nil {
 		return err
 	}

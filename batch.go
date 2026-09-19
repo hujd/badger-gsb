@@ -6,6 +6,7 @@
 package badger
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -29,6 +30,11 @@ type WriteBatch struct {
 	isManaged bool
 	commitTs  uint64
 	finished  bool
+
+	// ctx is propagated to each internal transaction and observed while a write
+	// waits for configured write backpressure in block mode. See
+	// (*Txn).WithContext. Nil means wait indefinitely.
+	ctx context.Context
 }
 
 // NewWriteBatch creates a new WriteBatch. This provides a way to conveniently do a lot of writes,
@@ -57,6 +63,18 @@ func (db *DB) newWriteBatch(isManaged bool) *WriteBatch {
 // 16 to minimise memory usage.
 func (wb *WriteBatch) SetMaxPendingTxns(max int) {
 	wb.throttle = y.NewThrottle(max)
+}
+
+// WithContext attaches ctx to the WriteBatch and returns the same WriteBatch.
+// The context applies to every transaction the batch commits internally: if a
+// commit is held up by write backpressure in block mode when ctx is cancelled,
+// that commit fails with ctx.Err() (its writes are not applied) and the error
+// surfaces from subsequent batch operations / Flush, ready to be retried.
+// Without it, blocked commits wait until room is available.
+func (wb *WriteBatch) WithContext(ctx context.Context) *WriteBatch {
+	wb.ctx = ctx
+	wb.txn.ctx = ctx
+	return wb
 }
 
 // Cancel function must be called if there's a chance that Flush might not get
@@ -203,6 +221,7 @@ func (wb *WriteBatch) commit() error {
 	wb.txn.CommitWith(wb.callback)
 	wb.txn = wb.db.newTransaction(true, wb.isManaged)
 	wb.txn.commitTs = wb.commitTs
+	wb.txn.ctx = wb.ctx
 	return wb.Error()
 }
 

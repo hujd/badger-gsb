@@ -1554,12 +1554,18 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 		return err
 	}
 
-	// If this compaction removed tables from L0, the L0 table count has dropped, so
-	// wake any flush goroutine stalled in addLevel0Table. Broadcasting after the
-	// deletion (and after releasing the level lock inside deleteTables) is safe:
-	// the waiter re-checks the stall predicate under the lock in a loop, so there
-	// is no lost-wakeup window.
+	// If this compaction removed tables from L0, the L0 table count has dropped,
+	// so wake the flush goroutine stalled in addLevel0Table AND any user write
+	// held back by a configured MaxL0Tables backpressure limit. Signalling after
+	// the deletion (and after releasing the level lock inside deleteTables) is
+	// safe: every waiter re-checks its predicate under its lock in a loop, so
+	// there is no lost-wakeup window.
 	if thisLevel.level == 0 && len(cd.top) > 0 {
+		// Gauge publishing takes db.lock itself; under DropPrefix this goroutine
+		// is already inside db.lock, so it blocks only briefly until the gauge
+		// read completes (which never blocks on compaction), no deadlock.
+		thisLevel.db.signalWriteProgress()
+		thisLevel.db.publishBackpressureGauges()
 		thisLevel.signalL0Drained()
 	}
 

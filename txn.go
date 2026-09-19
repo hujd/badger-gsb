@@ -255,6 +255,11 @@ type Txn struct {
 	discarded    bool
 	doneRead     bool
 	update       bool // update is used to conditionally keep track of reads.
+
+	// ctx is observed while a write commit waits for write backpressure in block
+	// mode (see DB.admitWrite). A nil ctx waits indefinitely, so historical
+	// Commit() behavior is unchanged. Set via (*Txn).WithContext.
+	ctx context.Context
 }
 
 type pendingWritesIterator struct {
@@ -518,6 +523,21 @@ func (txn *Txn) Discard() {
 	}
 }
 
+// WithContext attaches ctx to the transaction and returns the same Txn. The
+// context is consulted only when a write commit is held up by configured write
+// backpressure in block mode (Options.MaxPendingMemtables / MaxL0Tables): if
+// ctx is cancelled while the commit waits for flush/compaction to catch up,
+// Commit/CommitWith return ctx.Err() and the transaction's writes are not
+// applied (they can be retried with a new transaction). It has no effect on
+// read-only transactions or on any other blocking operation.
+//
+// Calling WithContext is optional; without it, or with a nil ctx, a blocked
+// commit waits until room is available (the historical behavior).
+func (txn *Txn) WithContext(ctx context.Context) *Txn {
+	txn.ctx = ctx
+	return txn
+}
+
 func (txn *Txn) commitAndSend() (func() error, error) {
 	orc := txn.db.orc
 	// Ensure that the order in which we get the commit timestamp is the same as
@@ -590,7 +610,11 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		entries = append(entries, e)
 	}
 
-	req, err := txn.db.sendToWriteCh(entries)
+	ctx := txn.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := txn.db.sendToWriteCh(ctx, entries)
 	if err != nil {
 		orc.doneCommit(commitTs)
 		return nil, err

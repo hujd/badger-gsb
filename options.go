@@ -19,6 +19,22 @@ import (
 	"github.com/dgraph-io/ristretto/v2/z"
 )
 
+// WriteBackpressureMode selects what happens to a write when a configured
+// backpressure limit has been reached.
+type WriteBackpressureMode int
+
+const (
+	// WriteBackpressureBlock blocks the write until the limits are no longer
+	// exceeded. The wait is interruptible through the context passed to
+	// Txn.WithContext / WriteBatch.WithContext (a nil context waits
+	// indefinitely, matching commits without a context). This is the default.
+	WriteBackpressureBlock WriteBackpressureMode = iota
+
+	// WriteBackpressureReject fails the write immediately with
+	// ErrWriteBackpressure. No data is written; callers should retry later.
+	WriteBackpressureReject
+)
+
 // Note: If you add a new option X make sure you also add a WithX method on Options.
 
 // Options are params for creating DB object.
@@ -72,6 +88,23 @@ type Options struct {
 
 	ValueLogFileSize   int64
 	ValueLogMaxEntries uint32
+
+	// Write backpressure (flow control on the write path).
+	//
+	// Both limits default to zero, which disables backpressure entirely and
+	// preserves the historical write-path behavior.
+	//
+	// MaxPendingMemtables bounds the number of in-memory memtables that have not
+	// yet been flushed to L0 (active memtable plus immutable memtables queued for
+	// flush). MaxL0Tables bounds the number of Level 0 tables. When either limit
+	// is reached, new writes are either blocked until flush/compaction catches up
+	// (WriteBackpressureBlock, interruptible via the context given to
+	// Txn.WithContext / WriteBatch.WithContext) or fail fast with
+	// ErrWriteBackpressure (WriteBackpressureReject), according to
+	// BackpressureMode.
+	MaxPendingMemtables int
+	MaxL0Tables         int
+	BackpressureMode    WriteBackpressureMode
 
 	NumCompactors        int
 	CompactL0OnClose     bool
@@ -571,6 +604,46 @@ func (opt Options) WithNumLevelZeroTables(val int) Options {
 // The default value of NumLevelZeroTablesStall is 15.
 func (opt Options) WithNumLevelZeroTablesStall(val int) Options {
 	opt.NumLevelZeroTablesStall = val
+	return opt
+}
+
+// WithMaxPendingMemtables returns a new Options value with MaxPendingMemtables
+// set to the given value.
+//
+// MaxPendingMemtables bounds how many memtables may remain in memory without
+// having been flushed to Level 0 (the active memtable plus immutable ones
+// queued for flush). Once the limit is reached, writes are blocked or rejected
+// according to BackpressureMode, until the flush goroutine catches up. This
+// caps memory growth during ingestion bursts that outpace disk throughput.
+//
+// The default value is 0, which disables the check and keeps the historical
+// behavior (writes only stall when flushChan, sized by NumMemtables, is full).
+func (opt Options) WithMaxPendingMemtables(val int) Options {
+	opt.MaxPendingMemtables = val
+	return opt
+}
+
+// WithMaxL0Tables returns a new Options value with MaxL0Tables set to the
+// given value.
+//
+// MaxL0Tables bounds the number of Level 0 tables admitted onto the write
+// path. Once the limit is reached, writes are blocked or rejected according to
+// BackpressureMode, until compaction drains L0. It is independent of
+// NumLevelZeroTables (compaction trigger) and NumLevelZeroTablesStall (the
+// hard internal stall applied by the flush goroutine); a configured
+// MaxL0Tables should be no greater than NumLevelZeroTablesStall.
+//
+// The default value is 0, which disables the check.
+func (opt Options) WithMaxL0Tables(val int) Options {
+	opt.MaxL0Tables = val
+	return opt
+}
+
+// WithBackpressureMode returns a new Options value with BackpressureMode set to
+// the given value. It only has an effect when MaxPendingMemtables or
+// MaxL0Tables is set. The default is WriteBackpressureBlock.
+func (opt Options) WithBackpressureMode(mode WriteBackpressureMode) Options {
+	opt.BackpressureMode = mode
 	return opt
 }
 

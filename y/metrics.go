@@ -60,6 +60,15 @@ var (
 	numCompactionTables *expvar.Int
 	// Total writes by a user in bytes
 	numBytesWrittenUser *expvar.Int
+
+	// Write-backpressure gauges (per-DB, keyed by dir) and cumulative counters
+	// (global across DB instances). Gauges are refreshed by the DB while
+	// metrics are enabled; counters are incremented live per held/rejected write.
+	bpPendingMemtables *expvar.Map
+	bpL0Tables         *expvar.Map
+	bpActive           *expvar.Map
+	bpBlocked          *expvar.Int
+	bpRejected         *expvar.Int
 )
 
 // These variables are global and have cumulative values for all kv stores.
@@ -93,6 +102,12 @@ func init() {
 
 	pendingWrites = expvar.NewMap(BADGER_METRIC_PREFIX + "write_pending_num_memtable")
 	numCompactionTables = expvar.NewInt(BADGER_METRIC_PREFIX + "compaction_current_num_lsm")
+
+	bpPendingMemtables = expvar.NewMap(BADGER_METRIC_PREFIX + "backpressure_pending_num_memtable")
+	bpL0Tables = expvar.NewMap(BADGER_METRIC_PREFIX + "backpressure_current_num_l0")
+	bpActive = expvar.NewMap(BADGER_METRIC_PREFIX + "backpressure_active")
+	bpBlocked = expvar.NewInt(BADGER_METRIC_PREFIX + "backpressure_blocked_total")
+	bpRejected = expvar.NewInt(BADGER_METRIC_PREFIX + "backpressure_rejected_total")
 }
 
 func NumIteratorsCreatedAdd(enabled bool, val int64) {
@@ -161,6 +176,38 @@ func VlogSizeSet(enabled bool, key string, val expvar.Var) {
 
 func PendingWritesSet(enabled bool, key string, val expvar.Var) {
 	storeToMap(enabled, pendingWrites, key, val)
+}
+
+func BPPendingMemtablesSet(enabled bool, key string, val int64) {
+	setMapGauge(enabled, bpPendingMemtables, key, val)
+}
+
+func BPL0TablesSet(enabled bool, key string, val int64) {
+	setMapGauge(enabled, bpL0Tables, key, val)
+}
+
+func BPActiveSet(enabled bool, key string, val int64) {
+	setMapGauge(enabled, bpActive, key, val)
+}
+
+func BPBlockedAdd(enabled bool, val int64) {
+	addInt(enabled, bpBlocked, val)
+}
+
+func BPRejectedAdd(enabled bool, val int64) {
+	addInt(enabled, bpRejected, val)
+}
+
+// setMapGauge sets metric[key] to an absolute value (as opposed to addToMap's
+// additive Add), suitable for point-in-time gauges.
+func setMapGauge(enabled bool, metric *expvar.Map, key string, val int64) {
+	if !enabled {
+		return
+	}
+
+	var v expvar.Int
+	v.Set(val)
+	metric.Set(key, &v)
 }
 
 func NumLSMBloomHitsAdd(enabled bool, key string, val int64) {
