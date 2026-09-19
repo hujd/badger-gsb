@@ -518,7 +518,7 @@ func (txn *Txn) Discard() {
 	}
 }
 
-func (txn *Txn) commitAndSend() (func() error, error) {
+func (txn *Txn) commitAndSend(ctx context.Context) (func() error, error) {
 	orc := txn.db.orc
 	// Ensure that the order in which we get the commit timestamp is the same as
 	// the order in which we push these updates to the write channel. So, we
@@ -590,7 +590,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		entries = append(entries, e)
 	}
 
-	req, err := txn.db.sendToWriteCh(entries)
+	req, err := txn.db.sendToWriteCh(ctx, entries)
 	if err != nil {
 		orc.doneCommit(commitTs)
 		return nil, err
@@ -647,6 +647,16 @@ func (txn *Txn) commitPrecheck() error {
 // If error is nil, the transaction is successfully committed. In case of a non-nil error, the LSM
 // tree won't be updated, so there's no need for any rollback.
 func (txn *Txn) Commit() error {
+	return txn.CommitContext(context.Background())
+}
+
+// CommitContext acts like Commit, but the provided context can cancel the wait
+// if the commit is throttled by write backpressure (see
+// Options.MaxUnflushedMemtables / Options.MaxL0Tables). When the context is
+// cancelled while waiting, CommitContext returns the context's error and the
+// transaction is not committed; it can be retried later. The context does not
+// abort a commit that has already been accepted by the write pipeline.
+func (txn *Txn) CommitContext(ctx context.Context) error {
 	// txn.conflictKeys can be zero if conflict detection is turned off. So we
 	// should check txn.pendingWrites.
 	if len(txn.pendingWrites) == 0 {
@@ -660,7 +670,7 @@ func (txn *Txn) Commit() error {
 	}
 	defer txn.Discard()
 
-	txnCb, err := txn.commitAndSend()
+	txnCb, err := txn.commitAndSend(ctx)
 	if err != nil {
 		return err
 	}
@@ -720,7 +730,7 @@ func (txn *Txn) CommitWith(cb func(error)) {
 
 	defer txn.Discard()
 
-	commitCb, err := txn.commitAndSend()
+	commitCb, err := txn.commitAndSend(context.Background())
 	if err != nil {
 		go runTxnCallback(&txnCb{user: cb, err: err})
 		return
@@ -804,11 +814,17 @@ func (db *DB) View(fn func(txn *Txn) error) error {
 // for the user. Error returned by the function is relayed by the Update method.
 // Update cannot be used with managed transactions.
 func (db *DB) Update(fn func(txn *Txn) error) error {
+	return db.UpdateContext(context.Background(), fn)
+}
+
+// UpdateContext acts like Update, but the provided context cancels the wait if
+// the commit is throttled by write backpressure (see Txn.CommitContext).
+func (db *DB) UpdateContext(ctx context.Context, fn func(txn *Txn) error) error {
 	if db.IsClosed() {
 		return ErrDBClosed
 	}
 	if db.opt.managedTxns {
-		panic("Update can only be used with managedDB=false.")
+		panic("UpdateContext can only be used with managedDB=false.")
 	}
 	txn := db.NewTransaction(true)
 	defer txn.Discard()
@@ -817,5 +833,5 @@ func (db *DB) Update(fn func(txn *Txn) error) error {
 		return err
 	}
 
-	return txn.Commit()
+	return txn.CommitContext(ctx)
 }

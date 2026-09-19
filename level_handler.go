@@ -105,6 +105,13 @@ func (s *levelHandler) deleteTables(toDel []*table.Table) error {
 
 	s.Unlock() // Unlock s _before_ we DecrRef our tables, which can be slow.
 
+	if s.level == 0 && s.db.bp.enabled {
+		// The L0 table count has dropped; wake any writers parked in admitWrite
+		// and refresh the backpressure gauges.
+		s.db.bpSignal()
+		s.db.bpRefreshGauges()
+	}
+
 	return decrRefs(toDel)
 }
 
@@ -219,6 +226,9 @@ func (s *levelHandler) addLevel0TableLocked(t *table.Table) {
 	s.tables = append(s.tables, t)
 	t.IncrRef()
 	s.addSize(t)
+	if s.db.bp.enabled {
+		y.NumL0TablesSet(s.db.opt.MetricsEnabled, int64(len(s.tables)))
+	}
 }
 
 // tryAddLevel0Table returns true if ok and no stalling.
@@ -235,6 +245,10 @@ func (s *levelHandler) tryAddLevel0Table(t *table.Table) bool {
 	s.tables = append(s.tables, t)
 	t.IncrRef()
 	s.addSize(t)
+
+	if s.db.bp.enabled {
+		y.NumL0TablesSet(s.db.opt.MetricsEnabled, int64(len(s.tables)))
+	}
 
 	return true
 }

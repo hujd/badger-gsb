@@ -60,6 +60,21 @@ var (
 	numCompactionTables *expvar.Int
 	// Total writes by a user in bytes
 	numBytesWrittenUser *expvar.Int
+
+	// WRITE BACKPRESSURE METRICS
+	// numUnflushedMemtables is the current number of memtables queued for flushing
+	numUnflushedMemtables *expvar.Int
+	// numL0Tables is the current number of tables in L0
+	numL0Tables *expvar.Int
+	// writeBackpressureThrottled is 1 while writes are being throttled by
+	// backpressure, 0 otherwise
+	writeBackpressureThrottled *expvar.Int
+	// numWriteBackpressureStalls is the cumulative number of writes that had to
+	// wait for the flush/compaction backlog to drain
+	numWriteBackpressureStalls *expvar.Int
+	// numWriteBackpressureRejections is the cumulative number of writes rejected
+	// with ErrWriteBackpressure (fail-fast mode)
+	numWriteBackpressureRejections *expvar.Int
 )
 
 // These variables are global and have cumulative values for all kv stores.
@@ -93,6 +108,17 @@ func init() {
 
 	pendingWrites = expvar.NewMap(BADGER_METRIC_PREFIX + "write_pending_num_memtable")
 	numCompactionTables = expvar.NewInt(BADGER_METRIC_PREFIX + "compaction_current_num_lsm")
+
+	numUnflushedMemtables = expvar.NewInt(
+		BADGER_METRIC_PREFIX + "write_backpressure_unflushed_num_memtable")
+	numL0Tables = expvar.NewInt(
+		BADGER_METRIC_PREFIX + "write_backpressure_num_table_l0")
+	writeBackpressureThrottled = expvar.NewInt(
+		BADGER_METRIC_PREFIX + "write_backpressure_throttled")
+	numWriteBackpressureStalls = expvar.NewInt(
+		BADGER_METRIC_PREFIX + "write_backpressure_stall_num")
+	numWriteBackpressureRejections = expvar.NewInt(
+		BADGER_METRIC_PREFIX + "write_backpressure_reject_num")
 }
 
 func NumIteratorsCreatedAdd(enabled bool, val int64) {
@@ -151,6 +177,38 @@ func NumCompactionTablesAdd(enabled bool, val int64) {
 	addInt(enabled, numCompactionTables, val)
 }
 
+// NumUnflushedMemtablesSet records the current number of unflushed memtables.
+func NumUnflushedMemtablesSet(enabled bool, val int64) {
+	setInt(enabled, numUnflushedMemtables, val)
+}
+
+// NumL0TablesSet records the current number of L0 tables.
+func NumL0TablesSet(enabled bool, val int64) {
+	setInt(enabled, numL0Tables, val)
+}
+
+// WriteBackpressureThrottledSet records whether writes are currently throttled
+// by write backpressure.
+func WriteBackpressureThrottledSet(enabled bool, throttled bool) {
+	var val int64
+	if throttled {
+		val = 1
+	}
+	setInt(enabled, writeBackpressureThrottled, val)
+}
+
+// NumWriteBackpressureStallsAdd adds to the cumulative count of writes that
+// had to wait for the flush/compaction backlog to drain.
+func NumWriteBackpressureStallsAdd(enabled bool, val int64) {
+	addInt(enabled, numWriteBackpressureStalls, val)
+}
+
+// NumWriteBackpressureRejectionsAdd adds to the cumulative count of writes
+// rejected with ErrWriteBackpressure.
+func NumWriteBackpressureRejectionsAdd(enabled bool, val int64) {
+	addInt(enabled, numWriteBackpressureRejections, val)
+}
+
 func LSMSizeSet(enabled bool, key string, val expvar.Var) {
 	storeToMap(enabled, lsmSize, key, val)
 }
@@ -185,6 +243,14 @@ func addInt(enabled bool, metric *expvar.Int, val int64) {
 	}
 
 	metric.Add(val)
+}
+
+func setInt(enabled bool, metric *expvar.Int, val int64) {
+	if !enabled {
+		return
+	}
+
+	metric.Set(val)
 }
 
 func addToMap(enabled bool, metric *expvar.Map, key string, val int64) {

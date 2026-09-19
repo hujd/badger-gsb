@@ -101,6 +101,10 @@ type DB struct {
 	// polled flushChan from writeRequests.
 	flushCond *sync.Cond
 
+	// bp is the write-admission backpressure gate. It is disabled unless
+	// Options.MaxUnflushedMemtables or Options.MaxL0Tables is set.
+	bp writeBackpressure
+
 	// Initialized via openMemTables.
 	nextMemFid int
 
@@ -158,6 +162,10 @@ func checkAndSetOptions(opt *Options) error {
 	opt.maxValueThreshold = math.Min(maxValueThreshold, float64(opt.maxBatchSize))
 	if opt.VLogPercentile < 0.0 || opt.VLogPercentile > 1.0 {
 		return errors.New("vlogPercentile must be within range of 0.0-1.0")
+	}
+
+	if opt.MaxUnflushedMemtables < 0 || opt.MaxL0Tables < 0 {
+		return errors.New("MaxUnflushedMemtables and MaxL0Tables must be >= 0")
 	}
 
 	// We are limiting opt.ValueThreshold to maxValueThreshold for now.
@@ -265,6 +273,7 @@ func Open(opt Options) (*DB, error) {
 
 	db.flushCond = sync.NewCond(&db.lock)
 	db.syncChan = opt.syncChan
+	db.bp = newWriteBackpressure(opt)
 
 	// Cleanup all the goroutines started by badger in case of an error.
 	defer func() {
@@ -404,6 +413,10 @@ func Open(opt Options) (*DB, error) {
 
 	db.closers.pub = z.NewCloser(1)
 	go db.pub.listenForUpdates(db.closers.pub)
+
+	// Publish the initial backpressure gauges (e.g. memtables replayed from the
+	// WAL into db.imm, L0 tables loaded from the manifest).
+	db.bpRefreshGauges()
 
 	valueDirLockGuard = nil
 	dirLockGuard = nil
@@ -572,6 +585,9 @@ func (db *DB) close() (err error) {
 		db.flushCond.Broadcast()
 	}
 	db.lock.Unlock()
+	// Wake any writers parked in admitWrite so they can observe IsClosed and
+	// return instead of waiting for a drain that will never come.
+	db.bpSignal()
 
 	if db.closers.valueGC != nil {
 		// Stop value GC first.
@@ -913,9 +929,16 @@ func (db *DB) writeRequests(reqs []*request) error {
 	return nil
 }
 
-func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
+func (db *DB) sendToWriteCh(ctx context.Context, entries []*Entry) (*request, error) {
 	if db.blockWrites.Load() == 1 {
 		return nil, ErrBlockedWrites
+	}
+	// Apply write backpressure before accepting the request. With no limits
+	// configured this is a no-op. In wait mode this blocks until the
+	// flush/compaction backlog drains, ctx is cancelled, or the DB closes; in
+	// fail-fast mode it returns ErrWriteBackpressure immediately.
+	if err := db.admitWrite(ctx); err != nil {
+		return nil, err
 	}
 	var count, size int64
 	for _, e := range entries {
@@ -1009,7 +1032,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 //
 //	Check(kv.BatchSet(entries))
 func (db *DB) batchSet(entries []*Entry) error {
-	req, err := db.sendToWriteCh(entries)
+	req, err := db.sendToWriteCh(context.Background(), entries)
 	if err != nil {
 		return err
 	}
@@ -1025,7 +1048,7 @@ func (db *DB) batchSet(entries []*Entry) error {
 //	   Check(err)
 //	}
 func (db *DB) batchSetAsync(entries []*Entry, f func(error)) error {
-	req, err := db.sendToWriteCh(entries)
+	req, err := db.sendToWriteCh(context.Background(), entries)
 	if err != nil {
 		return err
 	}
@@ -1058,6 +1081,9 @@ func (db *DB) ensureRoomForWrite() error {
 				db.mt.sl.MemSize(), len(db.flushChan))
 			// We manage to push this task. Let's modify imm.
 			db.imm = append(db.imm, db.mt)
+			if db.bp.enabled {
+				y.NumUnflushedMemtablesSet(db.opt.MetricsEnabled, int64(len(db.imm)))
+			}
 			db.mt, err = db.newMemTable()
 			if err != nil {
 				return y.Wrapf(err, "cannot create new mem table")
@@ -1174,6 +1200,9 @@ func (db *DB) flushMemtable(lc *z.Closer) {
 			y.AssertTrue(mt == db.imm[0])
 			db.imm = db.imm[1:]
 			mt.DecrRef() // Return memory.
+			if db.bp.enabled {
+				y.NumUnflushedMemtablesSet(db.opt.MetricsEnabled, int64(len(db.imm)))
+			}
 			// unlock
 			db.lock.Unlock()
 			// A memtable has been flushed and removed from imm; a slot in flushChan
@@ -1181,6 +1210,10 @@ func (db *DB) flushMemtable(lc *z.Closer) {
 			// retry its non-blocking push. Broadcasting after unlock is safe because
 			// the waiter re-checks (re-attempts the push) under db.lock in a loop.
 			db.flushCond.Broadcast()
+			// The unflushed-memtable backlog has shrunk; wake any writers parked
+			// in admitWrite and refresh the backpressure gauges.
+			db.bpSignal()
+			db.bpRefreshGauges()
 			break
 		}
 	}
@@ -1962,7 +1995,7 @@ func (db *DB) BanNamespace(ns uint64) error {
 		Key:   key,
 		Value: nil,
 	}}
-	req, err := db.sendToWriteCh(entry)
+	req, err := db.sendToWriteCh(context.Background(), entry)
 	if err != nil {
 		return err
 	}

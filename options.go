@@ -70,6 +70,20 @@ type Options struct {
 	NumLevelZeroTables      int
 	NumLevelZeroTablesStall int
 
+	// Write backpressure.
+	//
+	// MaxUnflushedMemtables and MaxL0Tables bound how far writes may run ahead
+	// of the flush/compaction pipeline. When either limit is reached, new
+	// writes are throttled: they either block until the backlog drains
+	// (BackpressureFailFast=false, the default; the wait is cancellable via the
+	// context-aware APIs UpdateContext/CommitContext) or fail immediately with
+	// ErrWriteBackpressure (BackpressureFailFast=true). A zero value disables
+	// the corresponding limit. When both are zero (the default), write
+	// admission is completely unthrottled, exactly as before.
+	MaxUnflushedMemtables int
+	MaxL0Tables           int
+	BackpressureFailFast  bool
+
 	ValueLogFileSize   int64
 	ValueLogMaxEntries uint32
 
@@ -517,6 +531,41 @@ func (opt Options) WithVLogPercentile(t float64) Options {
 // The default value of NumMemtables is 5.
 func (opt Options) WithNumMemtables(val int) Options {
 	opt.NumMemtables = val
+	return opt
+}
+
+// WithMaxUnflushedMemtables returns a new Options value with MaxUnflushedMemtables
+// set to the given value.
+//
+// MaxUnflushedMemtables sets the maximum number of memtables that may be queued
+// for flushing (i.e. not yet flushed to L0) before new writes are throttled.
+// Note that the queue itself is bounded by NumMemtables, so values larger than
+// NumMemtables can never trigger. Zero (the default) disables this limit.
+func (opt Options) WithMaxUnflushedMemtables(val int) Options {
+	opt.MaxUnflushedMemtables = val
+	return opt
+}
+
+// WithMaxL0Tables returns a new Options value with MaxL0Tables set to the given
+// value.
+//
+// MaxL0Tables sets the maximum number of L0 tables allowed before new writes
+// are throttled. Zero (the default) disables this limit.
+func (opt Options) WithMaxL0Tables(val int) Options {
+	opt.MaxL0Tables = val
+	return opt
+}
+
+// WithBackpressureFailFast returns a new Options value with BackpressureFailFast
+// set to the given value.
+//
+// BackpressureFailFast selects what happens to a write when a configured
+// backpressure limit (MaxUnflushedMemtables or MaxL0Tables) is reached: when
+// true, the write fails immediately with ErrWriteBackpressure; when false (the
+// default), the write blocks until the backlog drains, the DB is closed, or the
+// caller's context (see DB.UpdateContext / Txn.CommitContext) is cancelled.
+func (opt Options) WithBackpressureFailFast(val bool) Options {
+	opt.BackpressureFailFast = val
 	return opt
 }
 

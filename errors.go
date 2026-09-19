@@ -93,6 +93,16 @@ var (
 	// data from Badger, we stop accepting new writes, by returning this error.
 	ErrBlockedWrites = stderrors.New("Writes are blocked, possibly due to DropAll or Close")
 
+	// ErrWriteBackpressure is returned when a write is rejected because the number
+	// of unflushed memtables or L0 tables has reached the limit configured via
+	// Options.MaxUnflushedMemtables / Options.MaxL0Tables and
+	// Options.BackpressureFailFast is enabled. It signals transient overload
+	// (flush/compaction is falling behind), not a problem with the data itself;
+	// the write can be retried later. Use errors.Is(err, ErrWriteBackpressure)
+	// to detect it.
+	ErrWriteBackpressure = stderrors.New(
+		"Write rejected by backpressure: too many unflushed memtables or L0 tables")
+
 	// ErrNilCallback is returned when subscriber's callback is nil.
 	ErrNilCallback = stderrors.New("Callback cannot be nil")
 
