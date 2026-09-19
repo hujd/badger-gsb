@@ -143,3 +143,161 @@ func TestVerifyDetectsTamperedSegment(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(chain, seg.File), []byte("broken"), 0o644))
 	require.Error(t, backupchain.Verify(chain))
 }
+
+func del(t *testing.T, db *badger.DB, k string) {
+	t.Helper()
+	require.NoError(t, db.Update(func(txn *badger.Txn) error {
+		return txn.Delete([]byte(k))
+	}))
+}
+
+// TestRestoreKeepsNewestVersionWithinSegment compacts several versions of the
+// same key inside a single segment: the newest value must win, and a newest
+// entry that is a delete marker must stay deleted.
+func TestRestoreKeepsNewestVersionWithinSegment(t *testing.T) {
+	dir := t.TempDir()
+	src := newDB(t, filepath.Join(dir, "src"))
+	defer src.Close()
+
+	set(t, src, "updated", "v1")
+	set(t, src, "updated", "v2")
+	set(t, src, "updated", "v3")
+	set(t, src, "deleted", "gone")
+	del(t, src, "deleted")
+
+	chain := filepath.Join(dir, "chain")
+	mg, err := backupchain.Open(chain, src)
+	require.NoError(t, err)
+	_, err = mg.Backup()
+	require.NoError(t, err)
+
+	dst := newDB(t, filepath.Join(dir, "dst"))
+	defer dst.Close()
+	require.NoError(t, backupchain.Restore(chain, dst))
+
+	v, ok := get(t, dst, "updated")
+	require.True(t, ok)
+	require.Equal(t, "v3", v)
+	_, ok = get(t, dst, "deleted")
+	require.False(t, ok, "deleted key resurrected by restore")
+}
+
+// TestRestoreAcrossChainKeepsNewestVersion repeats the check across several
+// incremental segments.
+func TestRestoreAcrossChainKeepsNewestVersion(t *testing.T) {
+	dir := t.TempDir()
+	src := newDB(t, filepath.Join(dir, "src"))
+	defer src.Close()
+	chain := filepath.Join(dir, "chain")
+	mg, err := backupchain.Open(chain, src)
+	require.NoError(t, err)
+
+	set(t, src, "updated", "v1")
+	set(t, src, "deleted", "d1")
+	set(t, src, "stable", "s1")
+	_, err = mg.Backup()
+	require.NoError(t, err)
+
+	set(t, src, "updated", "v2")
+	del(t, src, "deleted")
+	_, err = mg.Backup()
+	require.NoError(t, err)
+
+	set(t, src, "updated", "v3")
+	set(t, src, "updated", "v4")
+	set(t, src, "updated", "v5")
+	_, err = mg.Backup()
+	require.NoError(t, err)
+
+	dst := newDB(t, filepath.Join(dir, "dst"))
+	defer dst.Close()
+	require.NoError(t, backupchain.Restore(chain, dst))
+
+	v, ok := get(t, dst, "updated")
+	require.True(t, ok)
+	require.Equal(t, "v5", v)
+	_, ok = get(t, dst, "deleted")
+	require.False(t, ok, "deleted key resurrected by restore")
+	v, ok = get(t, dst, "stable")
+	require.True(t, ok)
+	require.Equal(t, "s1", v)
+}
+
+// TestPruneThenRestore checks that pruning older segments does not strand the
+// remaining incrementals: the first kept segment becomes a full snapshot and
+// keys that only existed in pruned segments still restore, including the
+// latest value and deletions.
+func TestPruneThenRestore(t *testing.T) {
+	dir := t.TempDir()
+	src := newDB(t, filepath.Join(dir, "src"))
+	defer src.Close()
+	chain := filepath.Join(dir, "chain")
+	mg, err := backupchain.Open(chain, src)
+	require.NoError(t, err)
+
+	// Segment 0: full backup with the first batch of data.
+	for i := 0; i < 20; i++ {
+		set(t, src, fmt.Sprintf("old-%02d", i), fmt.Sprintf("v0-%d", i))
+	}
+	set(t, src, "will-delete", "alive")
+	_, err = mg.Backup()
+	require.NoError(t, err)
+
+	// Segment 1: update part of the old batch, delete one key, add new keys.
+	for i := 0; i < 10; i++ {
+		set(t, src, fmt.Sprintf("old-%02d", i), fmt.Sprintf("v1-%d", i))
+	}
+	del(t, src, "will-delete")
+	_, err = mg.Backup()
+	require.NoError(t, err)
+
+	// Segment 2.
+	for i := 0; i < 10; i++ {
+		set(t, src, fmt.Sprintf("new-%02d", i), "n")
+	}
+	_, err = mg.Backup()
+	require.NoError(t, err)
+
+	// Segment 3: one more update.
+	set(t, src, "old-00", "v3")
+	_, err = mg.Backup()
+	require.NoError(t, err)
+
+	dropped, err := mg.Prune(2)
+	require.NoError(t, err)
+	require.Equal(t, 2, dropped)
+
+	segs := mg.Manifest().Segments
+	require.Len(t, segs, 2)
+	require.Equal(t, "full", segs[0].Kind, "oldest kept segment must be promoted to full")
+	require.Equal(t, "incremental", segs[1].Kind)
+	require.NoError(t, backupchain.Verify(chain))
+
+	// Dropped files are gone, kept files are intact.
+	_, err = os.Stat(filepath.Join(chain, "segment-0000.bin"))
+	require.True(t, os.IsNotExist(err))
+
+	dst := newDB(t, filepath.Join(dir, "dst"))
+	defer dst.Close()
+	require.NoError(t, backupchain.Restore(chain, dst))
+
+	for i := 0; i < 20; i++ {
+		k := fmt.Sprintf("old-%02d", i)
+		v, ok := get(t, dst, k)
+		require.True(t, ok, "key %s lost after pruning old segments", k)
+		want := fmt.Sprintf("v0-%d", i)
+		if i < 10 {
+			want = fmt.Sprintf("v1-%d", i)
+		}
+		if k == "old-00" {
+			want = "v3"
+		}
+		require.Equal(t, want, v)
+	}
+	for i := 0; i < 10; i++ {
+		_, ok := get(t, dst, fmt.Sprintf("new-%02d", i))
+		require.True(t, ok)
+	}
+	_, ok := get(t, dst, "will-delete")
+	require.False(t, ok, "deleted key resurrected after prune+restore")
+}

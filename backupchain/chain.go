@@ -134,16 +134,70 @@ func (mg *Manager) Prune(keep int) (int, error) {
 		return 0, nil
 	}
 	drop := len(mg.m.Segments) - keep
-	for _, seg := range mg.m.Segments[:drop] {
+	dropped := mg.m.Segments[:drop]
+	kept := mg.m.Segments[drop:]
+
+	// The remaining segments may be incrementals that only contain keys
+	// changed after the dropped segments. Fold the dropped segments into
+	// the first remaining one, promoting it to a full snapshot covering
+	// everything written up to its UntilTs. Otherwise keys that only ever
+	// appeared in the dropped segments would be lost on restore.
+	if err := mg.promoteToFull(dropped, &kept[0]); err != nil {
+		return 0, err
+	}
+
+	for _, seg := range dropped {
 		if err := os.Remove(filepath.Join(mg.dir, seg.File)); err != nil && !os.IsNotExist(err) {
 			return 0, err
 		}
 	}
-	mg.m.Segments = append([]Segment(nil), mg.m.Segments[drop:]...)
+	mg.m.Segments = append([]Segment(nil), kept...)
 	if err := mg.m.save(mg.dir); err != nil {
 		return 0, err
 	}
 	return drop, nil
+}
+
+// promoteToFull merges the KVs of lead into firstKept, keeping only the
+// newest version of every key, and rewrites firstKept.File in place as a full
+// backup. firstKept's metadata is updated accordingly.
+func (mg *Manager) promoteToFull(lead []Segment, firstKept *Segment) error {
+	var kvs []*pb.KV
+	for _, seg := range append(append([]Segment(nil), lead...), *firstKept) {
+		entries, err := readSegment(filepath.Join(mg.dir, seg.File))
+		if err != nil {
+			return err
+		}
+		kvs = append(kvs, entries...)
+	}
+
+	merged := newestPerKey(kvs)
+
+	final := filepath.Join(mg.dir, firstKept.File)
+	tmp := final + ".promote"
+	defer os.Remove(tmp)
+	if err := writeSegmentAt(tmp, merged); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return err
+	}
+
+	firstKept.Kind = "full"
+	if len(lead) > 0 {
+		firstKept.SinceTs = lead[0].SinceTs
+	}
+	st, err := os.Stat(final)
+	if err != nil {
+		return err
+	}
+	sum, err := checksum(final)
+	if err != nil {
+		return err
+	}
+	firstKept.Size = st.Size()
+	firstKept.Checksum = sum
+	return nil
 }
 
 // compactSegment rewrites a badger backup stream keeping a single copy of every
@@ -156,7 +210,17 @@ func compactSegment(path string) error {
 	if len(kvs) == 0 {
 		return nil
 	}
-	sort.Slice(kvs, func(i, j int) bool {
+	return writeSegment(path, newestPerKey(kvs))
+}
+
+// newestPerKey returns the highest-version entry for every key. Versions are
+// what badger uses to order the history of a key: the highest one is its
+// current value, and a highest entry with the delete bit set means the key is
+// deleted. Keeping an older entry instead would resurrect stale values and
+// deleted keys on restore. The result is ordered by key, then version, which
+// is the order badger's loader expects within a stream.
+func newestPerKey(kvs []*pb.KV) []*pb.KV {
+	sort.SliceStable(kvs, func(i, j int) bool {
 		if c := bytes.Compare(kvs[i].Key, kvs[j].Key); c != 0 {
 			return c < 0
 		}
@@ -164,13 +228,12 @@ func compactSegment(path string) error {
 	})
 	kept := kvs[:0]
 	for i, kv := range kvs {
-		if i > 0 && bytes.Equal(kvs[i-1].Key, kv.Key) {
-			// Same key as the entry before: one copy is enough.
+		if i+1 < len(kvs) && bytes.Equal(kvs[i+1].Key, kv.Key) {
 			continue
 		}
 		kept = append(kept, kv)
 	}
-	return writeSegment(path, kept)
+	return kept
 }
 
 // readSegment reads a badger backup file: a sequence of length prefixed
@@ -212,7 +275,13 @@ const segmentBatch = 1000
 
 // writeSegment writes kvs back in the badger backup format.
 func writeSegment(path string, kvs []*pb.KV) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
+	return writeSegmentAt(path, kvs)
+}
+
+// writeSegmentAt writes kvs in the badger backup format to path, creating or
+// truncating the file.
+func writeSegmentAt(path string, kvs []*pb.KV) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
