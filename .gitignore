@@ -13,6 +13,8 @@ badger-test*/
 # Output of the go coverage tool
 *.out
 
+# Local cross-compile artifacts (make cross-compile / make ci)
+dist/
+
 #darwin
 .DS_Store
-
