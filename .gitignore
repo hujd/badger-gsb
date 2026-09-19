@@ -13,6 +13,11 @@ badger-test*/
 # Output of the go coverage tool
 *.out
 
+# Cross-compiled binaries from `make cross-compile`
+dist/
+
+# Local Go build/module cache (sandboxed runs)
+.gocache/
+
 #darwin
 .DS_Store
-
